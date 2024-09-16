@@ -1,11 +1,14 @@
-from anki.importing import Anki2Importer
-from anki.lang import _
-from anki.utils import json
-from aqt import mw
-from aqt.utils import showWarning
+import time
 
-from . import dialog
+from anki.hooks import schema_will_change
+from anki.importing import Anki2Importer
+from anki.importing.anki2 import Anki2Importer
+from anki.lang import _
+from aqt import mw
+
 from .config import getUserOption
+from .dialog import returnTagsText
+from .note_type_mapping import create_mapping_on_field_name_equality
 
 # #########################################################
 #
@@ -13,6 +16,7 @@ from .config import getUserOption
 #
 # #########################################################
 
+NID = 0
 GUID = 1
 MID = 2
 MOD = 3
@@ -30,7 +34,7 @@ def getUserOptionSpecial(key=None, default=None):
         return default
 
 
-def newImportNotes(self) -> None:
+def newImportNotes(self: Anki2Importer) -> None:
     # build guid -> (id,mod,mid) hash & map of existing note ids
     self._notes = {}
     existing = {}
@@ -54,16 +58,10 @@ def newImportNotes(self) -> None:
     dupesIdentical = []
     dupesIgnored = []
     total = 0
-    ########################################################################
-    # check if any models with special field exist
-    midCheck = []
-    a = mw.col.models.all()
-    for i in a:
-        fields = i["flds"]
-        for n in fields:
-            if n['name'] in getUserOptionSpecial("Special field", []) or getUserOptionSpecial("All fields are special", False):
-                midCheck.append(str(i["id"]))
-    ########################################################################
+
+    ######### note type mapping
+    schema_will_change.remove(mw.onSchemaMod)
+    ######### /note type mapping
 
     for note in self.src.db.execute("select * from notes"):
         total += 1
@@ -89,7 +87,10 @@ def newImportNotes(self) -> None:
             if self.allowUpdate:
                 oldNid, oldMod, oldMid = self._notes[note[GUID]]
                 # will update if incoming note more recent
-                if oldMod < note[MOD] or (not getUserOptionSpecial("update only if newer", True)):
+
+                if oldMod < note[MOD] or (
+                    not getUserOptionSpecial("update only if newer", True)
+                ):
                     # safe if note types identical
                     if oldMid == note[MID]:
                         # incoming note should use existing id
@@ -99,16 +100,60 @@ def newImportNotes(self) -> None:
                         update.append(note)
                         dirty.append(note[0])
                     else:
-                        dupesIgnored.append(note)
-                        self._ignoredGuids[note[GUID]] = True
+                        ######### note type mapping
+                        updateNoteType = getUserOptionSpecial("update note styling")
+
+                        old_model = self.dst.models.get(oldMid)
+                        target_model = self.dst.models.get(note[MID])
+
+                        mapping = create_mapping_on_field_name_equality(
+                            old_model, target_model
+                        )
+
+                        if updateNoteType and mapping:
+                            self.dst.models.change(
+                                old_model,
+                                [oldNid],
+                                target_model,
+                                mapping.get_field_map(),
+                                mapping.get_card_type_map(),
+                            )
+
+                            note[0] = oldNid
+                            note[4] = usn
+                            note[6] = self._mungeMedia(note[MID], note[6])
+                            update.append(note)
+                            dirty.append(note[0])
+
+                        ######### /note type mapping
+                        else:
+                            dupesIgnored.append(note)
+                            self._ignoredGuids[note[GUID]] = True
                 else:
                     dupesIdentical.append(note)
 
     self.log.append(_("Notes found in file: %d") % total)
 
+    ######### note type mapping
+    schema_will_change.append(mw.onSchemaMod)
+    ######### /note type mapping
+
+    ########################################################################
+    # check if any models with special field exist
+    midCheck = []
+    a = mw.col.models.all()
+    for i in a:
+        fields = i["flds"]
+        for n in fields:
+            if n["name"] in getUserOptionSpecial(
+                "Special field", []
+            ) or getUserOptionSpecial("All fields are special", False):
+                midCheck.append(str(i["id"]))
+    ########################################################################
+
     for note in update:
         oldnote = mw.col.getNote(note[0])
-        newTags = [t for t in note[5].replace('\u3000', ' ').split(" ") if t]
+        newTags = [t for t in note[5].replace("\u3000", " ").split(" ") if t]
         for tag in oldnote.tags:
             for i in newTags:
                 if i.lower() == tag.lower():
@@ -117,12 +162,31 @@ def newImportNotes(self) -> None:
 
         newTags = set(newTags)
         togetherTags = " %s " % " ".join(newTags)
+
+        ######### KEEP tags
+        keepTags = [t for t in note[5].replace("\u3000", " ").split(" ") if t]
+        for tag in oldnote.tags:
+            for i in keepTags:
+                if i.lower() == tag.lower():
+                    tag = i
+
+            for item in returnTagsText():
+                if item in tag:
+                    keepTags.append(tag)
+
+            if "marked" in tag or "leech" in tag:
+                keepTags.append(tag)
+
+        keepTags = set(keepTags)
+        keepTagsTogether = " %s " % " ".join(keepTags)
+        ######### /KEEP tags
+
         mid = str(note[2])
         if mid in midCheck:
             model = mw.col.models.get(mid)
             specialFields = getUserOptionSpecial("Special field", [])
             if getUserOptionSpecial("All fields are special", False):
-                specialFields = [fld['name'] for fld in model['flds']]
+                specialFields = [fld["name"] for fld in model["flds"]]
             # if this note belongs to a model with "Special Field"
             trow = list(note)
             for i in specialFields:
@@ -136,19 +200,20 @@ def newImportNotes(self) -> None:
                     # valueLocal = mw.col.getNote(note[0]).values()
                     # splitRow[indexOfField] = valueLocal[indexOfField]
 
-                    finalrow = ''
+                    finalrow = ""
                     count = 0
                     for a in splitRow:
                         if count == fieldOrd:
                             finalrow += str(fields[fieldOrd]) + "\x1f"
                         else:
-                            finalrow += a+"\x1f"
+                            finalrow += a + "\x1f"
                         count = count + 1
 
                     def rreplace(s, old, new, occurrence):
                         li = s.rsplit(old, occurrence)
                         return new.join(li)
-                    finarow = rreplace(finalrow, """\x1f""", '', 1)
+
+                    finarow = rreplace(finalrow, """\x1f""", "", 1)
                     note[6] = str(finarow)
                     # if note[0] == 1558556384609: #FOR TROUBLE SHOOTING ! Change to the card.id you are uncertain about
 
@@ -156,21 +221,25 @@ def newImportNotes(self) -> None:
                     pass
         if getUserOptionSpecial("Combine tagging", False):
             note[5] = togetherTags
+        else:
+            note[5] = keepTagsTogether
 
     self.log.append(_("Notes found in file: %d") % total)
 
     if dupesIgnored:
         self.log.append(
             _("Notes that could not be imported as note type has changed: %d")
-            % len(dupesIgnored))
+            % len(dupesIgnored)
+        )
     if update:
-        self.log.append(
-            _("Notes updated, as file had newer version: %d") % len(update))
+        self.log.append(_("Notes updated, as file had newer version: %d") % len(update))
     if add:
         self.log.append(_("Notes added from file: %d") % len(add))
     if dupesIdentical:
-        self.log.append(_("Notes skipped, as they're already in your collection: %d") %
-                        len(dupesIdentical))
+        self.log.append(
+            _("Notes skipped, as they're already in your collection: %d")
+            % len(dupesIdentical)
+        )
 
     self.log.append("")
 
@@ -207,7 +276,7 @@ def newImportNotes(self) -> None:
         for importedDid, importedDeck in ((d["id"], d) for d in self.src.decks.all()):
             localDid = self._did(importedDid)
             localDeck = self.dst.decks.get(localDid)
-            localDeck['desc'] = importedDeck['desc']
+            localDeck["desc"] = importedDeck["desc"]
             self.dst.decks.save(localDeck)
 
 
@@ -248,8 +317,11 @@ def _mid(self, srcMid):
         dstScm = self.dst.models.scmhash(dstModel)
         if srcScm == dstScm:
             # copy styling changes over if newer
-            if updateNoteType or (updateNoteType is None and srcModel["mod"] > dstModel["mod"]):
+            if updateNoteType or (
+                updateNoteType is None and srcModel["mod"] > dstModel["mod"]
+            ):
                 model = srcModel.copy()
+                model["mod"] = max(srcModel["mod"], dstModel["mod"])
                 model["id"] = mid
                 model["usn"] = self.col.usn()
                 self.dst.models.update(model)
@@ -262,6 +334,7 @@ def _mid(self, srcMid):
 
 
 Anki2Importer._mid = _mid
+
 
 def _did(self, did: int):
     "Given did in src col, return local id."
@@ -287,7 +360,7 @@ def _did(self, did: int):
         self._did(idInSrc)
     # if target is a filtered deck, we'll need a new deck name
     deck = self.dst.decks.byName(name)
-    
+
     is_new = not bool(deck)
 
     if deck and deck["dyn"]:
@@ -311,4 +384,12 @@ def _did(self, did: int):
     # add to deck map and return
     self._decks[did] = newid
     return newid
+
+
+def intTime(scale: int = 1) -> int:
+    # copied from aqt.utils of Anki versions < 2.1.50
+    "The time in integer seconds. Pass scale=1000 to get milliseconds."
+    return int(time.time() * scale)
+
+
 Anki2Importer._did = _did
